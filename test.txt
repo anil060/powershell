@@ -1,0 +1,162 @@
+# This script requires PowerShell 3 or later to run
+Add-Type -AssemblyName System.Web
+
+#------------------------------------------------------------------------------------------
+# You can set these to avoid being prompted 
+#------------------------------------------------------------------------------------------
+#$username = [string]:: #'e0000000'
+$username = 'PasswordIsAuthToken'
+
+# If password contains double quotes, surround with single quotes. 
+#$passwordPlain = [string]:: #'password123'
+$passwordPlain = 'e6d856b5-b4d4-4720-b525-e21d97ea7126'
+
+#------------------------------------------------------------------------------------------
+
+
+if ([string]::IsNullOrWhitespace($username)) {
+    $username = Read-Host -Prompt 'UCD Username'
+} else {
+    write-host 'UCD username: ' $username
+}
+
+if ([string]::IsNullOrWhitespace($passwordPlain)) {
+    # prompt for password as secure string to keep it less visible
+    $passwordSecure = Read-Host -Prompt 'UCD password' -AsSecureString
+} else {
+    $passwordSecure = ConvertTo-SecureString $passwordPlain –asplaintext –force
+}
+
+
+$password = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($passwordSecure))
+$type = 'application/json'
+$base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(("{0}:{1}" -f $username,$password)))
+$headers = @{"X-Requested-With"="XMLHttpRequest";Authorization="Basic $base64AuthInfo"}
+$baseUri = "https://urbancodedeploy.bkfs.com:8443"
+
+function Get-Relays {
+    try {
+
+        # GET PROPERTIES
+        $uri = "$baseUri/cli/relay"
+		
+        #write-host "$uri = $uri"
+        $relays = Invoke-RestMethod -uri $uri -headers $headers -method Get -ContentType $type
+		
+
+
+        if ($?) { 
+	        #continue... 
+	    }
+	    else { throw $Error }
+        
+        foreach ($relay in $relays) {
+            write-host $relay.name $relay.endpointId
+            #Get-Agents $relay.name $relay.endpointId
+        }
+    }
+    catch { 
+		
+        write-host $_.Exception.Response 
+		write-Host $agent
+        break
+    }
+}
+
+function Get-Agents($relayName, $relayID) {
+    try 
+    {
+        $outputFile = [System.IO.Path]::Combine($PSScriptRoot, ("output\\GetWebConversionAgents_$relayName.csv"))
+        if (test-path $outputFile) { 
+            remove-item $outputFile 
+        }
+        Add-Content $outputFile "Agent Name, Agent Status, Agent OS, Agent Home, Java Version, Java Home, Team 1, Team 2, Team 3, Team 4"
+        write-Host $agent.name $agentOS $agentHome $javaVersion $agentJavaHome
+
+        $uri = "$baseUri/rest/agent?&filterFields=relayId&filterValue_relayId=$relayID&filterType_relayId=eq&filterClass_relayId=String"
+        #write-host $uri
+        $agents = Invoke-RestMethod -uri $uri -headers $headers -method Get -ContentType $type
+
+        if ($?) { 
+	        #continue... 
+	    }
+	    else { throw $Error }
+		
+		$uriAgentProp = "$baseUri/cli/agentCLI/getProperty"
+
+        foreach ($agent in $agents) 
+        {
+			If ($agent.status -ne "OFFLINE" -and $agent.status -ne "Connecting" -and ![string]::IsNullOrWhitespace($agent.status)) 
+            {
+
+                $agentCLI = @{
+					agent = $agent.name
+					name = "sys.os.name"
+				}
+                $agentOS = Invoke-RestMethod -uri $uriAgentProp -headers $headers -method Get -Body $agentCLI -ContentType $type
+
+                $agentCLI = @{
+					agent = $agent.name
+					name = "sys.java.version"
+				}
+                $javaVersion = Invoke-RestMethod -uri $uriAgentProp -headers $headers -method Get -Body $agentCLI -ContentType $type
+
+                $agentCLI = @{
+					agent = $agent.name
+					name = "AGENT_HOME"
+				}
+                $agentHome = Invoke-RestMethod -uri $uriAgentProp -headers $headers -method Get -Body $agentCLI -ContentType $type
+
+                $agentCLI = @{
+					agent = $agent.name
+					name = "sys.IBM UrbanCode Deploy/java.home"
+				}
+                $agentJavaHome = Invoke-RestMethod -uri $uriAgentProp -headers $headers -method Get -Body $agentCLI -ContentType $type
+                
+                <#TO DO Generate team mappings#>
+                $uriAgentInformation = "$baseUri/cli/agentCLI/info?agent=" + $agent.name
+                #$agentInformation = Invoke-RestMethod -uri $uriAgentInformation -headers $headers -method Get -Body $agentCLI -ContentType $type
+                $agentInformation = Invoke-RestMethod -uri $uriAgentInformation -headers $headers -method Get -ContentType $type
+
+                $teams = $agentInformation.extendedSecurity.teams
+
+
+                $teamString = ""
+                foreach($team in $teams)
+                {
+                    $teamString = $teamString + "," + $team.teamLabel
+                }
+                
+                #write-Host $agent.name $agent.status $agentOS $agentHome $javaVersion $agentJavaHome
+                write-Host $agent.name $teamString
+
+                $formattedLine = $agent.name + "," + $agent.status + "," + $agentOS + "," + $agentHome  + "," + $javaVersion + "," + $agentJavaHome + $teamString
+                Add-Content $outputFile $formattedLine
+            }
+        }
+    }
+    catch { 
+		
+        write-host $_.Exception.Response 
+		write-Host $agent
+        break
+    }
+}
+
+$sw = [Diagnostics.Stopwatch]::StartNew()
+
+ Get-Relays 'JTCENTLUCDAR01' 'agentRelay-3rtsM468RvKP3tJ4'
+#Get-Agents 'RTCMPSLUCDAR01' 'agentRelay-wFkhxTLPvc3Ef6ox'
+#Get-Agents 'RTCMPSLUCDAR02' 'agentRelay-i98lr2Zx5VuwFzAc'
+#Get-Agents 'JTCENTLUCDAR02' 'agentRelay-KImRZzwDuWiZ01KS'
+#Get-Agents 'jtcprflucdar02' 'agentRelay-mXe6yAJxUc4V8ruq'
+#Get-Agents 'jtcprflucdar03' 'agentRelay-lPOJpEXLctzYOJqS'
+#Get-Agents 'jtcprflucdar04' 'agentRelay-iINWAH1ysiyLKA8N'
+#Get-Agents 'RTCMPSLUCDAR01' 'agentRelay-wFkhxTLPvc3Ef6ox'
+#Get-Agents 'rtcmpslucdar02' 'agentRelay-i98lr2Zx5VuwFzAc'
+#Get-Agents 'JTCNPUDEPRELAY1' 'agentRelay-J7uVSdVidJCN7KPq'
+#Get-Agents 'JTCUDEPRELAY1' 'agentRelay-OY1hD2FQiUk5hByO'
+#Get-Agents 'MTCUDEPRELAY1' 'agentRelay-o9rLP1SxoEPlPnDb'
+
+$sw.Stop()
+write-host $sw.Elapsed.TotalSeconds "total seconds to execute"
