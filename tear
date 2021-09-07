@@ -1,0 +1,410 @@
+<#
+
+    To invoke this script in Visual Studio Code or PowerShell ISE
+    define the variables on lines 13-29 and hit F5.
+
+#>
+
+# local developer environment
+if ($host.name -match 'ISE|V*S*Code')
+{
+    cls
+    $startTime = (get-date)
+    $env:Release_DefinitionName             = "{local developer environment undefined variable}"
+    $env:Release_ReleaseName                = "$env:ComputerName, $env:UserDomain\$env:UserName"
+    $env:Build_DefinitionName               = "{local developer environment undefined variable}"
+    $env:Build_BuildNUMBER                  = get-date -format "yyyy.MM.dd.HH.mm.ss"
+    $env:System_DefaultWorkingDirectory     = "$env:UserProfile\Documents\Terraform\_LOCAL_STAGING"
+    $env:Release_EnvironmentName            = "sb122-usb"
+    $env:Build_SourceBranchName             = "{local developer environment undefined variable}"
+    $env:environmentName                    = "sb122-usb"
+    $env:isNewEnvironment                   = "true"
+    $env:division                           = "OT"
+    $env:application                        = "SD"
+    $env:stage                              = "DEV"
+    $env:destroy                            = "false"
+    $env:active_active                      = "false"
+    $env:dr                                 = "false"
+    $env:System_TeamFoundationCollectionURI = https://tfsenterprise.bkfs.com/tfs/Leveraged/
+    $env:System_TeamProject                 = "OTCentral"
+
+    if ( test-path $env:System_DefaultWorkingDirectory\*\*\stage ) { rd $env:System_DefaultWorkingDirectory\*\*\stage -rec -force -verbose }
+}
+
+# Azure DevOps API
+$apiVersion = "5.0"; echo "Azure DevOps API Version: $apiVersion`r`n"
+
+# PowerShell Version
+$psVersion = "$($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)"; echo "Powershell Version: $psVersion`r`n"
+
+# Azure DevOps collection
+$collection = $env:System_TeamFoundationCollectionURI
+$teamProject = $env:System_TeamProject
+$tfsUrl = $collection + $teamProject
+
+# force Invoke-WebRequest alias iwr and Invoke-RestMethod alias irm PowerShell cmdlets to use TLS 1.2
+[net.ServicePointManager]::SecurityProtocol = [net.SecurityProtocolType]::tls12
+
+# working directory
+set-location $env:System_DefaultWorkingDirectory
+
+# method to retain build pipeline artifacts indefinitely
+function Enable-RetainIndefinitely ($BuildId)
+{
+    $uri = "${tfsUrl}/_apis/build/builds/${BuildId}?api-version=${apiVersion}"
+
+    $retentionPolicy = @{
+        keepForever = 'true'
+        retainedByRelease = 'true'
+    }
+
+    $jsonBody = $retentionPolicy | ConvertTo-json
+
+    $result = irm -UseDefaultCredentials -method patch -uri $uri -body $jsonBody -ContentType "application/json"
+    $resultKeepForever = $result.keepForever.ToString()
+    $resultRetainedByRelease = $result.retainedByRelease.ToString()
+
+    return "`tBuild pipeline artifact '$BuildId' keepForever '$resultKeepForever' and retainedByRelease '$resultRetainedByRelease'.`r`n"
+}
+
+# method to stage Azure DevOps artifacts and Terraform Enterprise scripts
+function Stage-Services
+{
+    echo "_____Staging_____`n`r"
+
+    # get build artifact path
+    $buildArtifactDir = (ls $env:System_DefaultWorkingDirectory).GetDirectories()[0].FullName
+    echo "`r`t- `$buildArtifactDir = $buildArtifactDir"
+
+    # get environment config directory
+    $envConfigDir = "$buildArtifactDir\Environments\$env:Release_EnvironmentName"
+    echo "`r`t- `$envConfigDir = $envConfigDir"
+
+    # get workspace config directory
+    if ($env:dr -ieq "true") { $workspaceConfigDir = "$buildArtifactDir\Workspace\DWS_DR" }
+    else { $workspaceConfigDir = "$buildArtifactDir\Workspace\DWS" }
+    echo "`r`t- `$workspaceConfigDir = $workspaceConfigDir"
+
+    # create stage dirctory
+    $stageDir = (md "$buildArtifactDir\stage" -Force).FullName
+    echo "`r`t- `$stageDir = $stageDir"
+
+    # create stage/common dir - intended to store common build artifacts prior to putting them into right env.
+    $commonDir = "$stageDir\common"; if (!(test-path $commonDir)) { [void] ( md $commonDir -Force ) }
+    echo "`r`t- `$commonDir: $commonDir"
+
+    # copy workspace configuration to stage & configure for this dynamic workspace
+    copy "$workspaceConfigDir\main.tf" $stageDir
+    ( gc ( ls $stageDir\main.tf ) ).replace('<DWS_Name>', "DCL-$env:division-$env:application-$env:environmentName-$env:stage") | sc $stageDir\main.tf
+
+    # omit environment configuration if destroy flag set
+    echo ("`r`t! Destroy environment? " + $env:destroy.ToUpper() )
+    if ( $env:destroy.ToLower() -eq "true" )
+    {
+        echo "`r`t`t! Omiting environment configuration from stage`n`r"
+
+        # stop staging
+        return;
+    }
+
+    # create environment directory under stage
+    $envStageDir = ( md ( "$stageDir\" + $env:Release_EnvironmentName.ToLower() ) -force ).FullName
+   echo "`r`t- `$envStageDir = $envStageDir"
+
+    # copy environment module call to stage & configure for this environment
+    $envModuleCallFile = ( "$stageDir\" + $env:Release_EnvironmentName.ToLower() + ".tf")
+    copy "$workspaceConfigDir\env_call_template.tf" $envModuleCallFile -force
+    ( gc ( ls $envModuleCallFile ) ).replace('<env_name>', $env:Release_EnvironmentName.ToLower() ) | sc $envModuleCallFile
+
+    # copy environment configuration to stage\env
+    copy "$envConfigDir\main.tf" "$envStageDir" -force
+
+    # copy any local modules to $envStageDir
+    if ( test-path "$buildArtifactDir\modules" ) { copy "$buildArtifactDir\modules" "$envStageDir\modules" -rec -force }
+
+    # get list of services and versions
+    [string] $buildsFile = "$envConfigDir\builds.txt"
+    [string] $buildsFile = $buildsFile.TrimEnd()
+    [string[]] $buildsFileContent = gc -path @($buildsFile)
+
+    echo  "`n`r===== start $env:Release_EnvironmentName =====`n`r"
+
+    ForEach ($buildsFileItem in $buildsFileContent)
+    {
+        echo "`r`t- service: $buildsFileItem"
+
+        # get service name, definition Id and version which is the service's Major.Minor.Release or Major.Minor.Release.Build
+        [string[]] $buildsFileContentElements = $buildsFileItem.split('=').trim()
+        $serviceName = $buildsFileContentElements[0]
+        $defIdAndServiceVersion = $buildsFileContentElements[1]
+
+        # split definition Id and version which is the service's Major.Minor.Release or Major.Minor.Release.Build
+        [string[]] $buildIdAndVersion = $defIdAndServiceVersion.split(':').trim()
+        $defId = $buildIdAndVersion[0]
+        $serviceVersion = $buildIdAndVersion[1]
+
+        # split $serviceVersion on the period between octets Major.Minor.Release.Build, and create build octet array element variable
+        [string[]] $serviceVersionOctets = $serviceVersion.split('.').trim()
+        $serviceVersionBuildOctet = $serviceVersionOctets[3]
+
+        <#
+          DefinitionIds greater than 2190 are GIT pipelines except for the following TFVC pipelines.
+          During the TFVC to GIT migration, Reports definitionId=2190 was used to determine TFVC or GIT pipelines.
+
+          BuyLoanSkill-1.2.2-Dev, definitionId=2405
+          ExchangeAssetsService-1.2.2-Dev, definitionId=2407
+          HandleNotificationService-1.2.2-Dev, definitionId=2409
+          IdentityService-1.2.2-Dev, definitionId=2413
+          LoanManagementService-1.2.2-Dev, definitionId=2418
+          SellerWorkspace-1.2.2-Dev, definitionId=2419
+          TransactionCacheService-1.2.2-Dev, definitionId=2421
+          OpsUtilities-2.1.1, definitionId=2483
+        #>
+        $defIdExceptions = '2405','2407','2409','2413','2418','2419','2421','2483'
+
+        # major.minor.release
+        $serviceVersionReleaseOctet = $serviceVersionOctets[2]
+
+        # get artifact name
+        if ( $serviceVersionReleaseOctet -ieq "master" ) { $artifactName = "$serviceName.Master.$serviceVersionBuildOctet" } # Git Master e.g AskService = 659:0.0.master.65004
+        ElseIf ( $serviceVersionReleaseOctet -ieq "dev" ) { $artifactName = "$serviceName.Dev.$serviceVersionBuildOctet" } # Git Dev e.g. BuyLoanSkill = 1818:0.0.dev.91081
+        #ElseIf ([int]$defId -lt 2190 -or [int]$defId -in ,2405,2407,2409,2413,2418,2419,2421,2483 ) { $artifactName = "$serviceName-$serviceVersion-Dev" } # TFVC with suffix "*-Dev" e.g. HandleNotificationService = 1882:2.1.1.90791
+        ElseIf ( [int]$defId -lt 2190 -or [int]$defId -in $defIdExceptions ) { $artifactName = "$serviceName-$serviceVersion-Dev" } # TFVC with suffix "*-Dev" e.g. HandleNotificationService = 1882:2.1.1.90791
+        else { $artifactName = "$serviceName.$serviceVersion" } # Git Release e.g. HandleNotificationService = 1882:2.1.1.90791
+
+        # call method to retain build artifacts indefinitely if QA, UAT or PROD
+        if ( $env:environmentName -like 'QA' -or $env:environmentName -like 'UAT' -or $env:environmentName -like 'CIT' -or $env:environmentName -like 'PROD' ) { Enable-RetainIndefinitely $serviceVersionBuildOctet }
+
+        # download specific build artifact version
+        $commonArtifactPath = "$commonDir\$artifactName.zip"
+        $outFileDir = "$envStageDir"; if (!(test-path $outFileDir)) { [void] (md $outFileDir) }
+        if (test-path $commonArtifactPath)
+        {
+            # if arifacts existis in common folder
+            echo  "`r`t`t- artifact found: $commonArtifactPath"
+            # copy form common to environemnt folder.
+            echo  "`r`t`t- copying artifact to: $outFileDir\$artifactName.zip"
+            copy $commonArtifactPath $outFileDir\$artifactName.zip
+        }
+        else
+        {
+            $uri = "${tfsUrl}/_apis/build/builds/${serviceVersionBuildOctet}/artifacts?artifactName=${artifactName}&" + "`$format=zip&" + "api-version=${apiVersion}"
+
+            # if does not exist, download to common folder and then copy to environemnt folder
+            echo "`r`t`t- artifact not found: $commonArtifactPath"
+            echo "`r`t`t- downloading artifact to: $commonArtifactPath"
+            echo "`r`t`t- url: $uri"
+
+            # download artifact
+            iwr -UseDefaultCredentials -method get $uri -OutFile "$commonArtifactPath"
+
+            # copy form common to environemnt folder
+            echo "`r`t`t- copying artifact to: $outFileDir\$artifactName.zip"
+            copy $commonArtifactPath $outFileDir\$artifactName.zip
+        }
+
+        # extract service build zip to stage dir
+        [void] (expand-archive "$outFileDir\$artifactName.zip" "$outFileDir")
+
+        # remove extracted service build zip version
+        if ( $host.name -match 'ISE|V*S*Code' ) { start-sleep -seconds 2 }
+        mv "$outFileDir\$artifactName" "$outFileDir\$serviceName" -force
+
+        # delete service build zip
+        ri "$envStageDir\$artifactName.zip" -force
+
+        # copy builds.txt to bucket_content
+        $bucketDirServiceMap = @{SellerWorkspace = "bucket_content"; POS = "Pointofsale"; LOD = ""}
+        $bucketContentDir = "$outFileDir\$serviceName\artifacts\$($bucketDirServiceMap[$serviceName])"
+
+        if ( ($serviceName -in $bucketDirServiceMap.keys) -and (test-path $bucketContentDir) )
+        {
+            # copy builds.txt
+            $buildsFileCopy = copy $buildsFile $bucketContentDir -PassThru
+
+            # capture copied file content
+            $content = gc "$bucketContentDir\builds.txt"
+
+            # capture/format timestamp
+            $deploy_time = get-date -format "dddd yyyy-MM-dd HH:mm UTCzz"
+
+            # add release name, terraform build, timestamp to builds.txt footer
+            $buildsFooter = @("","",
+                            "release name    = $env:Release_ReleaseName",
+                            "terraform build = $env:Build_BuildNUMBER",
+                            "deploy time     = $deploy_time (deployment start time)"
+                            )
+
+            # write footer to builds.txt
+            $content + $buildsFooter | sc "$bucketContentDir\builds.txt"
+        }
+    }
+
+    # move service module calls to stage directory
+    echo "`r`t`t- Moving Service module calls to stage..."
+    gci *.tf -rec | where { $_.BaseName.equals($_.directory.name) } | ForEach {
+        mv $_.FullName $_.directory.parent.FullName -force
+        $tfFile = "`r`t`t`t" + "- " + $_.name
+        echo $tfFile 
+    }
+
+    # enable override files if initial Environment standups
+    echo ( "`r`t`t- Enable override configurations for inital environment standup... " + $env:isNewEnvironment.ToUpper() )
+    if ( $env:isNewEnvironment -eq "true" )
+    {
+        gci *override.tf.newEnv -rec | ForEach {
+            mv -Path $_.FullName -Destination $_.FullName.replace(".newEnv", "")
+            $tfFile = "`r`t`t`t" + "- " + $_.Directory.BaseName + "\" + $_.name
+            echo $tfFile
+        }
+    }
+
+    #region Disaster/Recovery
+
+    # override tf files
+    if ( $env:dr -eq "true" )
+    {
+        echo ( "`r`t`t- Enable DR Terraform configurations" )
+        gci *.tf.dr -rec | ForEach {
+            ri $_.FullName.replace(".dr", "")
+            mv -path $_.FullName -destination $_.FullName.replace(".dr", "")
+            $tfFile = "`r`t`t`t" + "- " + $_.directory.BaseName + "\" + $_.name
+            echo $tfFile
+        }
+    }
+
+    #endregion Disaster/Recovery
+
+    #region Active/Active
+
+    # aa variables
+    $isAA = $env:active_active -eq "true"
+    $aaRegionalTypes = "apigateway,lambda,cognito,elasticsearch,regional,data,sqs".split(',')
+    $aaRegion = "us-east-2"
+    $aaRegionAlias = "use2"
+    $aaTagMap = @{
+        "__region__"         = ( "",        "-$aaRegion"                        )
+        "__region_suffix__"  = ( "",        ("_" + $aaRegion.replace("-", "") ) )
+        "__region_alias__"   = ( "",        ".$aaRegionAlias"                   )
+        "__vpc_region__"     = ( "useast1", "useast2"                           )
+        "__waf_name_index__" = ( "0",       "1"                                 )
+    }
+
+    # log step w/ flag value
+    echo ( "`t`t- Enable Active/Active... " + ([string]$isAA).ToUpper() )
+
+    # enable aa files
+    if ( $isAA ) { gci *.tf.aa -rec | ForEach { mv -Path $_.FullName -Destination $_.FullName.Replace(".aa", "") -Force; echo ("`t`t`t" + "- " + $_.Directory.BaseName + "\" + $_.Name) } }
+
+    # iterate through all *.tf* files
+    gci $stageDir\*.tf* -Recurse | where { !$_.FullName.Contains("modules") } | ForEach {
+
+        # capture file resource type
+        $type = $_.BaseName.Split("_")[0]
+
+        # handle service module calls
+        # if env stage dir contains a dir w/ same name, then this is a service module call
+        if ( $isAA -and [string[]]( ls $_.Directory -directory ) -contains $_.BaseName )
+        {
+            $serviceModuleCallFile = $_
+
+            # get service module call content
+            $serviceModuleCallContent = gc $serviceModuleCallFile
+
+            $isRegionalArg = $false
+
+            $serviceModuleCallContent | ForEach {
+
+                # output original line
+                $_
+
+                # handle regional arg lines
+                if ( $_ -like "*###Regional_Variables*" )
+                {
+                    # flip regional flag to true when tag found
+                    $isRegionalArg = $true
+                }
+                ElseIf ( $_ -like "*###End_Regional_Variables*" )
+                {
+                    # flip regional flag back to flase when end tag found
+                    $isRegionalArg = $false
+                }
+                ElseIf ( $isRegionalArg -and $_.split('=').Length -eq 2 )
+                {
+                    # for remaining arg lines
+                    # split line into 2 sides on assignment operator
+                    $argSides = $_.split('=').trim()
+
+                    # add region suffix to both sides
+                    $newLeftSide = $argSides[0] + $aaTagMap['__region_suffix__'][1]
+                    $newRightSide = $argSides[1] + $aaTagMap['__region_suffix__'][1]
+
+                    # concat new line
+                    $newLine = "  " + $newLeftSide + " = " + $newRightSide
+
+                    # output new line
+                    $newLine
+                }
+            } | sc $serviceModuleCallFile
+        }
+
+        # capture original file path
+        $aaFileOriginal = $_.FullName
+
+        # check if file resource type is regional
+        if ( $aaRegionalTypes.contains($type) )
+        {
+            # duplicate file if regional type
+            if ( $isAA )
+            {
+                $aaFileCopy = $_.FullName.replace( $_.BaseName, $_.BaseName + "_$aaRegionAlias" )
+                #echo ( "`t`t`t- " + $aaFileOriginal.Split('\')[-1] + " >> "  + $aaFileCopy.Split('\')[-1] )
+                copy $_.FullName $aaFileCopy
+            }
+        }
+
+        # replace all tags in file content
+        $aaTagMap.Keys | ForEach {
+            #echo ( "`t`t`t`t- replacing " + $_ )
+            # replace tags in original file
+            $content = gc $aaFileOriginal
+            if ( $content -ne $null ) { $content.replace($_, $aaTagMap[$_][0]) | sc $aaFileOriginal -force }
+
+            # replace tags in copied file
+            if ( $isAA -and $aaRegionalTypes.Contains($type) -and $content -ne $null)
+            {
+                (gc $aaFileCopy).Replace($_, $aaTagMap[$_][1]) | sc $aaFileCopy
+            }
+        }
+    }
+
+    echo  "`n`r===== end $env:Release_EnvironmentName =====`n`r"
+
+    #endregion Active/Active
+
+    # write builds.txt to the console
+    if ( $buildsFileCopy )
+    {
+      echo "`r`n`r`n------------------------- [ Release Notes ] -------------------------`r`n"
+      cat $buildsFileCopy
+      echo "---------------------------------------------------------------------`r`n`r`n"
+    }
+}
+
+# call method to stage Azure DevOps artifacts and Terraform Enterprise scripts
+Stage-Services
+
+# local developer environment
+if ( $host.name -match 'ISE|V*S*Code' )
+{
+    echo "---------- [ Local Staging Runtime Metrics ] ----------`r`n"
+    $endTime = (get-date); $elapsedTime = $endTime-$startTime
+    "Start: $startTime"
+    "End: $endTime"
+    'Duration: {0:mm} min {0:ss} sec`r`n' -f $elapsedTime
+    echo "-------------------------------------------------------`r`n`r`n"
+
+    echo "---------- [ Local Staging Environment Variables ] ----------"
+    dir env:
+    echo "-------------------------------------------------------------"
+}
