@@ -1,0 +1,112 @@
+#region Synopsis
+
+<#           Revision History
+
+                                Version:               9.2.1
+                                Author:               mailto:Ken.Bartell@bkfs.com, tel:1-330-749-1058
+                                   Date:  2019-03-16
+                                   Note: TFS#692833 CR1107 - JP2LTLWJKNAAP01 setup - Maven Build Process - Jenkins Enterprise Windows Servers Implementation
+                                    Doc:   http://10.48.134.110:8081/CR1107-LendingSpace-9.0.1-Maven-Build-Process.pdf
+#>
+
+
+<#           Overview of Script
+
+                                The purpose of this script is to asynchronously invoke '../build/build.ps1' with parameters and improve the synchronous build times from 60 minutes to asynchronous build times of 45 minutes.
+#>
+
+<#           Brief Description of Script
+
+                                1. Invoke TFS get label takes 5 minutes
+                                2. Invoke builds asynchronously which takes 15 minutes.
+                                                2.1. Invoke Work Engine ZookWare build.
+                                                2.2. Invoke Maven build.
+                                                2.3. Invoke Dacpac build.
+                                3. Capture the asynchronous builds' return codes. If error level is '0', invoke UCD API calls which takes 10 minutes
+                                4. If UCD API calls error level is '0', Clean Workspace which takes 5 minutes.
+#>
+
+<#           Team Foundation Server (TFS) Application Lifecycle Management (ALM) Work Item Tracking (WIT)
+
+                                TFS work item 617898
+                                                http://10.49.71.62:8080/tfs/OTG/LendingSpace/_workitems#_a=edit&id=617898
+
+                                TFS work item 631587
+                                                http://10.49.71.62:8080/tfs/OTG/LendingSpace/_workitems#_a=edit&id=631587
+
+                                TFS work item 634085
+                                                http://10.49.71.62:8080/tfs/OTG/LendingSpace/_workitems#_a=edit&id=634085
+#>
+
+#endregion Synopsis
+
+#region Prerequisites
+
+<#           PowerShell Requirements to Run this Script
+
+                                The "#requires" statement prevents a script from running unless the PowerShell version, modules, snap-ins, module and snap-in version, and edition prerequisites are met. If the prerequisites are not met, PowerShell does not run the script.
+#>
+
+##requires -version 6.0
+##requires -version 5.1
+##requires -RunAsAdministrator
+
+#endregion Prerequisites
+
+<#
+
+Set build description plugin
+
+                Execute Windows batch command
+
+                                Command
+
+                                                @set release=9.0.2
+                                                @set Description=%release%.%BUILD_NUMBER%
+                                                @echo Description: %Description%
+
+                Set build description
+
+                                Regular Expression
+
+                                                ^Description: (.*)
+
+                                Description
+
+                                                \1
+#>
+
+#region Properties
+
+[string] $release = "9.2.1"
+[string] $buildScript = $env:WORKSPACE + "\build\build.ps1"
+
+$emailSmtpServer = "10.49.67.151"
+$emailFrom = OTG-LS-BuildNotifications@bkfs.com
+$emailTo = OTG_LSBuild_Notify_Dev@bkfs.com, Koteswararao.Muppa@bkfs.com, Suvendu.Kishor.Mishra@bkfs.com, srikanth.varma.gadhiraju@bkfs.com
+$emailBody = "$env:BUILD_URL"
+
+#endregion Properties
+
+#region Execution
+
+cd $env:WORKSPACE
+
+& $buildScript $release true false true true true false; $errorLevel = $LastExitCode
+
+if ($errorLevel -ne 0)
+{
+                $buildState = " FAILED!"
+}
+
+else
+{
+                $buildState = " Successful"
+}
+
+$emailSubject = "LendingSpace " + $release + "." + $env:BUILD_NUMBER + $buildState
+Send-MailMessage -Priority High -To $emailTo -From $emailFrom -Subject $emailSubject -BodyAsHtml $emailBody -SmtpServer $emailSmtpServer -Verbose
+
+exit $errorLevel
+
+#endregion Execution
